@@ -21,6 +21,8 @@ Client → [LLM-Doze proxy :8000] → [vLLM backend localhost:8900]
 3. The request is forwarded to the backend
 4. After no requests for `idle_timeout` seconds, the backend is automatically stopped
 
+On startup, LLM-Doze probes each backend's health endpoint to detect already-running services and track them for idle shutdown.
+
 ## Supported backend types
 
 | Type | `stop` field | Behavior |
@@ -67,14 +69,29 @@ Set `Environment=RUST_LOG=debug` in the service file for verbose output.
 ## Usage
 
 ```bash
-# Use default config.yaml in current directory
+# Start the proxy (default config: /etc/llm-doze/config.yaml)
 llm-doze
 
 # Specify config file and bind address
-llm-doze --config /etc/llm-doze/config.yaml --bind 0.0.0.0
+llm-doze --config /path/to/config.yaml --bind 0.0.0.0
 
 # Set log level
-RUST_LOG=debug llm-doze --config config.yaml
+RUST_LOG=debug llm-doze
+
+# Check status of all backends
+llm-doze status
+```
+
+### Status
+
+`llm-doze status` connects to the running process via a unix socket (`/run/llm-doze.sock`) and shows live state, idle time, and timeout for each server:
+
+```
+NAME            PORT  BACKEND          STATUS              IDLE  TIMEOUT
+────────────  ──────  ───────────────  ────────────  ──────────  ───────
+vllm-qwen3.6    8000  localhost:8900   ● running       3m 42s     600s
+ollama         11434  localhost:11435  ○ stopped              -     600s
+reranker        8090  localhost:8091   ○ stopped              -     300s
 ```
 
 ## Configuration
