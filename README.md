@@ -76,13 +76,13 @@ Set `Environment=RUST_LOG=debug` in the service file for verbose output.
 
 ```bash
 # Start the proxy (default config: /etc/llm-doze/config.yaml)
-llm-doze
+llm-doze serve
 
 # Specify config file and bind address
-llm-doze --config /path/to/config.yaml --bind 0.0.0.0
+llm-doze --config /path/to/config.yaml serve --bind 0.0.0.0
 
 # Set log level
-RUST_LOG=debug llm-doze
+RUST_LOG=debug llm-doze serve
 
 # Check status of all backends
 llm-doze status
