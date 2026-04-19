@@ -127,7 +127,7 @@ listeners:
 
 ### Model-based routing
 
-Multiple models can share a single port. The proxy inspects the `model` field in the JSON request body and routes to the matching backend. Each model has its own independent lifecycle.
+Multiple models can share a single port. The proxy inspects the `model` field in the JSON request body and routes to the matching backend.
 
 ```yaml
 listeners:
@@ -149,6 +149,30 @@ listeners:
 Single-route listeners don't need a `model` field — requests are forwarded directly without body inspection.
 
 `GET /v1/models` on a multi-route listener returns the list of available models.
+
+### Exclusive mode
+
+Set `exclusive: true` on a listener to ensure only one model runs at a time. Requesting a different model will stop the current backend before starting the new one. This prevents OOM from accidentally running multiple large models on the same GPU.
+
+```yaml
+listeners:
+  - port: 8000
+    exclusive: true
+    routes:
+      - name: large-model
+        model: Large-70B
+        backend: localhost:8900
+        start: docker compose -f large.yml up -d
+        stop: docker compose -f large.yml down
+
+      - name: small-model
+        model: Small-7B
+        backend: localhost:8901
+        start: docker compose -f small.yml up -d
+        stop: docker compose -f small.yml down
+```
+
+When a model switch happens, the logs show: `exclusive: switching models from=Large-70B to=Small-7B`.
 
 ### Authentication
 

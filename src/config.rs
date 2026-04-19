@@ -20,6 +20,10 @@ pub struct ListenerConfig {
     pub port: u16,
     #[serde(default)]
     pub auth: Option<AuthConfig>,
+    /// Only one route can be active at a time. Requesting a different model
+    /// will stop the current backend before starting the new one.
+    #[serde(default)]
+    pub exclusive: bool,
     pub routes: Vec<RouteConfig>,
 }
 

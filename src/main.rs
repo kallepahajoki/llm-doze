@@ -124,7 +124,31 @@ async fn run_serve(config: &Config, bind: &str) -> Result<(), Box<dyn std::error
                     routes.insert(model.clone(), Arc::clone(server));
                 }
             }
-            ListenerRouter::Multi { routes }
+            if listener_config.exclusive {
+                // Detect which model is already active (from startup probe)
+                let mut initial_active = None;
+                for server in &route_servers {
+                    if server.get_state().await == server::ServerState::Running {
+                        if let Some(ref model) = server.config.model {
+                            initial_active = Some(model.clone());
+                            break;
+                        }
+                    }
+                }
+                if initial_active.is_some() {
+                    info!(
+                        port = listener_config.port,
+                        model = ?initial_active,
+                        "exclusive listener: detected active model"
+                    );
+                }
+                ListenerRouter::Exclusive {
+                    routes,
+                    active: tokio::sync::RwLock::new(initial_active),
+                }
+            } else {
+                ListenerRouter::Multi { routes }
+            }
         };
 
         let router = Arc::new(router);

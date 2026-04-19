@@ -8,10 +8,12 @@ auth:
   # enabled: true
 
 listeners:
-  # Multi-model routing on a single port
-  # The proxy inspects the "model" field in the request body and routes
-  # to the matching backend. Each model has its own lifecycle.
+  # Exclusive multi-model routing on a single port.
+  # Only one model can run at a time — requesting a different model
+  # stops the current backend before starting the new one.
+  # Prevents OOM from accidentally running multiple large models.
   - port: 8000
+    exclusive: true
     routes:
       - name: vllm-large
         model: Large-Model-70B
