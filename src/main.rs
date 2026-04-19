@@ -23,7 +23,7 @@ use server::ManagedServer;
 #[command(name = "llm-doze", about = "LLM reverse proxy with auto start/stop")]
 struct Cli {
     /// Path to configuration file
-    #[arg(short, long, default_value = "config.yaml")]
+    #[arg(short, long, default_value = "/etc/llm-doze/config.yaml")]
     config: PathBuf,
 
     /// Bind address (0.0.0.0 for all interfaces)
