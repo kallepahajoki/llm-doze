@@ -22,21 +22,24 @@ const SOCK_PATH: &str = "/run/llm-doze.sock";
 
 #[derive(Parser)]
 #[command(name = "llm-doze", about = "LLM reverse proxy with auto start/stop")]
+#[command(subcommand_required = true, arg_required_else_help = true)]
 struct Cli {
     /// Path to configuration file
-    #[arg(short, long, default_value = "/etc/llm-doze/config.yaml")]
+    #[arg(short, long, default_value = "/etc/llm-doze/config.yaml", global = true)]
     config: PathBuf,
 
-    /// Bind address (0.0.0.0 for all interfaces)
-    #[arg(short, long, default_value = "0.0.0.0")]
-    bind: String,
-
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start the proxy server
+    Serve {
+        /// Bind address (0.0.0.0 for all interfaces)
+        #[arg(short, long, default_value = "0.0.0.0")]
+        bind: String,
+    },
     /// Check status of all configured backends
     Status,
 }
@@ -47,13 +50,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(&cli.config)?;
 
     match cli.command {
-        Some(Commands::Status) => {
+        Commands::Status => {
             run_status().await;
             return Ok(());
         }
-        None => {}
+        Commands::Serve { ref bind } => {
+            run_serve(&config, bind).await?;
+        }
     }
 
+    Ok(())
+}
+
+async fn run_serve(config: &Config, bind: &str) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -63,7 +72,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(
         servers = config.servers.len(),
-        config = %cli.config.display(),
         "loaded configuration"
     );
 
@@ -99,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         servers.push(Arc::clone(&managed));
 
-        let addr: SocketAddr = format!("{}:{}", cli.bind, server_config.listen).parse()?;
+        let addr: SocketAddr = format!("{}:{}", bind, server_config.listen).parse()?;
 
         // Spawn idle monitor
         let monitor_server = Arc::clone(&managed);
@@ -139,6 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
 
 async fn run_management_socket(
     servers: Vec<Arc<ManagedServer>>,
