@@ -7,6 +7,7 @@ A Rust-based reverse proxy that automatically starts and stops LLM backend servi
 - **No power draw when idle** — GPU servers only run when there are active requests
 - **Authentication** — Bearer token auth in front of services that don't have their own
 - **Localhost isolation** — Bind backends to 127.0.0.1, expose only the proxy on 0.0.0.0
+- **Model-based routing** — Multiple models on a single port, routed by the `model` field in the request
 
 ## How it works
 
@@ -17,9 +18,10 @@ Client → [LLM-Doze proxy :8000] → [vLLM backend localhost:8900]
 ```
 
 1. A request arrives at the proxy port
-2. If the backend is stopped, LLM-Doze starts it and waits for the health check to pass
-3. The request is forwarded to the backend
-4. After no requests for `idle_timeout` seconds, the backend is automatically stopped
+2. If multiple routes share the port, the request body is inspected for the `model` field to pick the right backend
+3. If the backend is stopped, LLM-Doze starts it and waits for the health check to pass
+4. The request is forwarded to the backend
+5. After no requests for `idle_timeout` seconds, the backend is automatically stopped
 
 On startup, LLM-Doze probes each backend's health endpoint to detect already-running services and track them for idle shutdown.
 
@@ -90,7 +92,7 @@ llm-doze status
 
 ### Status
 
-`llm-doze status` connects to the running process via a unix socket (`/run/llm-doze.sock`) and shows live state, idle time, and timeout for each server:
+`llm-doze status` connects to the running process via a unix socket (`/run/llm-doze.sock`) and shows live state, idle time, and timeout for each backend:
 
 ```
 NAME            PORT  BACKEND          STATUS              IDLE  TIMEOUT
@@ -104,40 +106,70 @@ reranker        8090  localhost:8091   ○ stopped              -     300s
 
 See [config.sample.yaml](config.sample.yaml) for a full example.
 
+The config is organized as **listeners** (one per port), each with one or more **routes** (backends):
+
 ```yaml
 auth:
   token: "your-secret-token"
 
-servers:
-  - name: my-llm
-    listen: 8000              # proxy listens on this port
-    backend: localhost:8900   # forward to this address
-    start: docker compose up -d
-    stop: docker compose down
-    health: /health           # health check endpoint (default: /health)
-    idle_timeout: 600         # seconds before auto-stop (default: 600)
-    startup_timeout: 300      # max wait for health check (default: 300)
-    startup_poll_interval: 2  # poll interval in seconds (default: 2)
+listeners:
+  - port: 8000
+    routes:
+      - name: my-llm
+        backend: localhost:8900
+        start: docker compose up -d
+        stop: docker compose down
+        health: /health           # default: /health
+        idle_timeout: 600         # seconds before auto-stop (default: 600)
+        startup_timeout: 300      # max wait for health check (default: 300)
+        startup_poll_interval: 2  # poll interval in seconds (default: 2)
 ```
+
+### Model-based routing
+
+Multiple models can share a single port. The proxy inspects the `model` field in the JSON request body and routes to the matching backend. Each model has its own independent lifecycle.
+
+```yaml
+listeners:
+  - port: 8000
+    routes:
+      - name: large-model
+        model: Large-70B        # matches {"model": "Large-70B"} in requests
+        backend: localhost:8900
+        start: docker compose -f large.yml up -d
+        stop: docker compose -f large.yml down
+
+      - name: small-model
+        model: Small-7B
+        backend: localhost:8901
+        start: docker compose -f small.yml up -d
+        stop: docker compose -f small.yml down
+```
+
+Single-route listeners don't need a `model` field — requests are forwarded directly without body inspection.
+
+`GET /v1/models` on a multi-route listener returns the list of available models.
 
 ### Authentication
 
-Global auth applies to all servers. Per-server auth overrides the global setting:
+Auth is resolved in three tiers: route > listener > global. Each level can override or disable auth:
 
 ```yaml
 auth:
   token: "global-token"
 
-servers:
-  - name: public-model
-    # ...
+listeners:
+  - port: 8000
     auth:
-      enabled: false          # no auth for this server
-
-  - name: private-model
-    # ...
-    auth:
-      token: "private-token"  # different token for this server
+      token: "listener-token"     # overrides global for all routes on this port
+    routes:
+      - name: public-model
+        auth:
+          enabled: false          # no auth for this route
+      - name: private-model
+        model: Private-7B
+        auth:
+          token: "route-token"    # overrides listener token
 ```
 
 Clients authenticate with: `Authorization: Bearer <token>`

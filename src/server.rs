@@ -3,7 +3,7 @@ use tokio::process::Child;
 use tokio::sync::{Mutex, Notify, RwLock};
 use std::time::Instant;
 
-use crate::config::ServerConfig;
+use crate::config::RouteConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerState {
@@ -25,7 +25,8 @@ impl std::fmt::Display for ServerState {
 }
 
 pub struct ManagedServer {
-    pub config: ServerConfig,
+    pub config: RouteConfig,
+    pub port: u16,
     pub state: RwLock<ServerState>,
     pub last_request: RwLock<Instant>,
     pub startup_notify: Notify,
@@ -35,9 +36,10 @@ pub struct ManagedServer {
 }
 
 impl ManagedServer {
-    pub fn new(config: ServerConfig, auth_token: Option<String>) -> Arc<Self> {
+    pub fn new(config: RouteConfig, port: u16, auth_token: Option<String>) -> Arc<Self> {
         Arc::new(Self {
             config,
+            port,
             state: RwLock::new(ServerState::Stopped),
             last_request: RwLock::new(Instant::now()),
             startup_notify: Notify::new(),
@@ -77,10 +79,10 @@ impl ManagedServer {
 mod tests {
     use super::*;
 
-    fn test_config() -> ServerConfig {
-        ServerConfig {
+    fn test_config() -> RouteConfig {
+        RouteConfig {
             name: "test".to_string(),
-            listen: 8000,
+            model: None,
             backend: "localhost:8001".to_string(),
             start: "echo start".to_string(),
             stop: "echo stop".to_string(),
@@ -94,13 +96,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_initial_state_is_stopped() {
-        let server = ManagedServer::new(test_config(), None);
+        let server = ManagedServer::new(test_config(), 8000, None);
         assert_eq!(server.get_state().await, ServerState::Stopped);
     }
 
     #[tokio::test]
     async fn test_state_transitions() {
-        let server = ManagedServer::new(test_config(), None);
+        let server = ManagedServer::new(test_config(), 8000, None);
         server.set_state(ServerState::Starting).await;
         assert_eq!(server.get_state().await, ServerState::Starting);
         server.set_state(ServerState::Running).await;
@@ -113,7 +115,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_touch_updates_last_request() {
-        let server = ManagedServer::new(test_config(), None);
+        let server = ManagedServer::new(test_config(), 8000, None);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let before = server.idle_seconds().await;
         server.touch().await;
@@ -123,7 +125,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_token_stored() {
-        let server = ManagedServer::new(test_config(), Some("secret".to_string()));
+        let server = ManagedServer::new(test_config(), 8000, Some("secret".to_string()));
         assert_eq!(server.auth_token.as_deref(), Some("secret"));
     }
 }

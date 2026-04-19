@@ -4,6 +4,7 @@ mod lifecycle;
 mod proxy;
 mod server;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use config::Config;
+use proxy::ListenerRouter;
 use server::ManagedServer;
 
 const SOCK_PATH: &str = "/run/llm-doze.sock";
@@ -71,76 +73,100 @@ async fn run_serve(config: &Config, bind: &str) -> Result<(), Box<dyn std::error
         .init();
 
     info!(
-        servers = config.servers.len(),
+        listeners = config.listeners.len(),
         "loaded configuration"
     );
 
-    let mut servers: Vec<Arc<ManagedServer>> = Vec::new();
+    let mut all_servers: Vec<Arc<ManagedServer>> = Vec::new();
     let mut handles = Vec::new();
 
-    // Probe backends to detect already-running services
+    // Probe client for health checks
     let probe_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build_http::<http_body_util::Empty<bytes::Bytes>>();
 
-    for server_config in &config.servers {
-        let auth_token = config
-            .effective_token(server_config)
-            .map(|s| s.to_string());
-        let managed = ManagedServer::new(server_config.clone(), auth_token);
+    for listener_config in &config.listeners {
+        let mut route_servers: Vec<Arc<ManagedServer>> = Vec::new();
 
-        // Check if backend is already running
-        let url = server_config.backend_url(&server_config.health);
-        if let Ok(resp) = probe_client
-            .get(url.parse::<hyper::Uri>().unwrap())
-            .await
-        {
-            if resp.status().is_success() {
-                info!(
-                    server = %server_config.name,
-                    "backend already running, tracking for idle shutdown"
-                );
-                managed.set_state(server::ServerState::Running).await;
-                managed.touch().await;
+        for route in &listener_config.routes {
+            let auth_token = config
+                .effective_token(listener_config, route)
+                .map(|s| s.to_string());
+            let managed = ManagedServer::new(route.clone(), listener_config.port, auth_token);
+
+            // Probe backend health
+            let url = route.backend_url(&route.health);
+            if let Ok(resp) = probe_client.get(url.parse::<hyper::Uri>().unwrap()).await {
+                if resp.status().is_success() {
+                    info!(
+                        server = %route.name,
+                        "backend already running, tracking for idle shutdown"
+                    );
+                    managed.set_state(server::ServerState::Running).await;
+                    managed.touch().await;
+                }
             }
+
+            // Spawn idle monitor
+            let monitor = Arc::clone(&managed);
+            tokio::spawn(lifecycle::idle_monitor(monitor));
+
+            route_servers.push(managed);
         }
 
-        servers.push(Arc::clone(&managed));
+        // Build router
+        let router = if route_servers.len() == 1 {
+            ListenerRouter::Single(Arc::clone(&route_servers[0]))
+        } else {
+            let mut routes = HashMap::new();
+            for server in &route_servers {
+                if let Some(ref model) = server.config.model {
+                    routes.insert(model.clone(), Arc::clone(server));
+                }
+            }
+            ListenerRouter::Multi { routes }
+        };
 
-        let addr: SocketAddr = format!("{}:{}", bind, server_config.listen).parse()?;
+        let router = Arc::new(router);
+        let addr: SocketAddr = format!("{}:{}", bind, listener_config.port).parse()?;
 
-        // Spawn idle monitor
-        let monitor_server = Arc::clone(&managed);
-        tokio::spawn(lifecycle::idle_monitor(monitor_server));
-
-        // Spawn listener
-        let listener_server = Arc::clone(&managed);
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_listener(addr, listener_server).await {
+            if let Err(e) = run_listener(addr, router).await {
                 error!(error = %e, "listener failed");
             }
         });
 
-        info!(
-            name = %server_config.name,
-            listen = %addr,
-            backend = %server_config.backend,
-            managed_subprocess = server_config.is_managed_subprocess(),
-            "registered server"
-        );
+        for server in &route_servers {
+            let route_type = if listener_config.routes.len() > 1 {
+                server
+                    .config
+                    .model
+                    .as_deref()
+                    .unwrap_or("?")
+            } else {
+                "single"
+            };
+            info!(
+                name = %server.config.name,
+                listen = %addr,
+                backend = %server.config.backend,
+                route = route_type,
+                "registered route"
+            );
+        }
 
+        all_servers.extend(route_servers);
         handles.push(handle);
     }
 
     // Spawn management socket
-    let mgmt_servers = servers.clone();
+    let mgmt_servers = all_servers;
     tokio::spawn(async move {
         if let Err(e) = run_management_socket(mgmt_servers).await {
             error!(error = %e, "management socket failed");
         }
     });
 
-    // Wait for all listeners (they run forever unless error)
     for handle in handles {
         handle.await?;
     }
@@ -148,11 +174,9 @@ async fn run_serve(config: &Config, bind: &str) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-
 async fn run_management_socket(
     servers: Vec<Arc<ManagedServer>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Clean up stale socket
     let _ = std::fs::remove_file(SOCK_PATH);
 
     let listener = tokio::net::UnixListener::bind(SOCK_PATH)?;
@@ -181,9 +205,15 @@ async fn build_status_response(
     for s in servers {
         let state = s.get_state().await;
         let idle = s.idle_seconds().await;
+        let model = s
+            .config
+            .model
+            .as_deref()
+            .unwrap_or("")
+            .replace('"', "\\\"");
         entries.push(format!(
-            "{{\"name\":\"{}\",\"port\":{},\"backend\":\"{}\",\"state\":\"{}\",\"idle_seconds\":{},\"idle_timeout\":{}}}",
-            s.config.name, s.config.listen, s.config.backend, state, idle, s.config.idle_timeout
+            "{{\"name\":\"{}\",\"port\":{},\"backend\":\"{}\",\"model\":\"{}\",\"state\":\"{}\",\"idle_seconds\":{},\"idle_timeout\":{}}}",
+            s.config.name, s.port, s.config.backend, model, state, idle, s.config.idle_timeout
         ));
     }
     let body = format!("[{}]", entries.join(","));
@@ -195,7 +225,6 @@ async fn build_status_response(
 }
 
 async fn run_status() {
-    // Connect to management socket
     let stream = match tokio::net::UnixStream::connect(SOCK_PATH).await {
         Ok(s) => s,
         Err(_) => {
@@ -222,7 +251,6 @@ async fn run_status() {
     let bytes = body.collect().await.unwrap().to_bytes();
     let json: Vec<StatusEntry> = serde_json::from_slice(&bytes).unwrap();
 
-    // Print table
     let name_width = json.iter().map(|e| e.name.len()).max().unwrap_or(4).max(4);
     let backend_width = json
         .iter()
@@ -230,20 +258,45 @@ async fn run_status() {
         .max()
         .unwrap_or(7)
         .max(7);
+    let model_width = json
+        .iter()
+        .map(|e| e.model.len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
 
-    println!(
-        "{:<name_width$}  {:>6}  {:<backend_width$}  {:<12}  {:>10}  {:>7}",
-        "NAME", "PORT", "BACKEND", "STATUS", "IDLE", "TIMEOUT"
-    );
-    println!(
-        "{:<name_width$}  {:>6}  {:<backend_width$}  {:<12}  {:>10}  {:>7}",
-        "─".repeat(name_width),
-        "──────",
-        "─".repeat(backend_width),
-        "────────────",
-        "──────────",
-        "───────"
-    );
+    let has_models = json.iter().any(|e| !e.model.is_empty());
+
+    if has_models {
+        println!(
+            "{:<name_width$}  {:>6}  {:<model_width$}  {:<backend_width$}  {:<12}  {:>10}  {:>7}",
+            "NAME", "PORT", "MODEL", "BACKEND", "STATUS", "IDLE", "TIMEOUT"
+        );
+        println!(
+            "{:<name_width$}  {:>6}  {:<model_width$}  {:<backend_width$}  {:<12}  {:>10}  {:>7}",
+            "─".repeat(name_width),
+            "──────",
+            "─".repeat(model_width),
+            "─".repeat(backend_width),
+            "────────────",
+            "──────────",
+            "───────"
+        );
+    } else {
+        println!(
+            "{:<name_width$}  {:>6}  {:<backend_width$}  {:<12}  {:>10}  {:>7}",
+            "NAME", "PORT", "BACKEND", "STATUS", "IDLE", "TIMEOUT"
+        );
+        println!(
+            "{:<name_width$}  {:>6}  {:<backend_width$}  {:<12}  {:>10}  {:>7}",
+            "─".repeat(name_width),
+            "──────",
+            "─".repeat(backend_width),
+            "────────────",
+            "──────────",
+            "───────"
+        );
+    }
 
     for entry in &json {
         let (indicator, idle_str) = match entry.state.as_str() {
@@ -252,15 +305,17 @@ async fn run_status() {
             "stopping" => ("◼ stopping", "-".to_string()),
             _ => ("○ stopped", "-".to_string()),
         };
-        println!(
-            "{:<name_width$}  {:>6}  {:<backend_width$}  {:<12}  {:>10}  {:>6}s",
-            entry.name,
-            entry.port,
-            entry.backend,
-            indicator,
-            idle_str,
-            entry.idle_timeout
-        );
+        if has_models {
+            println!(
+                "{:<name_width$}  {:>6}  {:<model_width$}  {:<backend_width$}  {:<12}  {:>10}  {:>6}s",
+                entry.name, entry.port, entry.model, entry.backend, indicator, idle_str, entry.idle_timeout
+            );
+        } else {
+            println!(
+                "{:<name_width$}  {:>6}  {:<backend_width$}  {:<12}  {:>10}  {:>6}s",
+                entry.name, entry.port, entry.backend, indicator, idle_str, entry.idle_timeout
+            );
+        }
     }
 }
 
@@ -279,6 +334,8 @@ struct StatusEntry {
     name: String,
     port: u16,
     backend: String,
+    #[serde(default)]
+    model: String,
     state: String,
     idle_seconds: u64,
     idle_timeout: u64,
@@ -286,20 +343,20 @@ struct StatusEntry {
 
 async fn run_listener(
     addr: SocketAddr,
-    server: Arc<ManagedServer>,
+    router: Arc<ListenerRouter>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     info!(addr = %addr, "listening");
 
     loop {
         let (stream, remote) = listener.accept().await?;
-        let server = Arc::clone(&server);
+        let router = Arc::clone(&router);
 
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req| {
-                let server = Arc::clone(&server);
-                async move { proxy::handle_request(server, req).await }
+                let router = Arc::clone(&router);
+                async move { proxy::handle_request(router, req).await }
             });
 
             if let Err(e) = http1::Builder::new()

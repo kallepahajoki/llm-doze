@@ -5,7 +5,7 @@ use std::path::Path;
 pub struct Config {
     #[serde(default)]
     pub auth: Option<AuthConfig>,
-    pub servers: Vec<ServerConfig>,
+    pub listeners: Vec<ListenerConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -16,9 +16,18 @@ pub struct AuthConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ServerConfig {
+pub struct ListenerConfig {
+    pub port: u16,
+    #[serde(default)]
+    pub auth: Option<AuthConfig>,
+    pub routes: Vec<RouteConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RouteConfig {
     pub name: String,
-    pub listen: u16,
+    #[serde(default)]
+    pub model: Option<String>,
     pub backend: String,
     pub start: String,
     pub stop: String,
@@ -54,7 +63,7 @@ fn default_startup_poll_interval() -> u64 {
     2
 }
 
-impl ServerConfig {
+impl RouteConfig {
     pub fn is_managed_subprocess(&self) -> bool {
         self.stop == "managed-subprocess"
     }
@@ -73,43 +82,88 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.servers.is_empty() {
-            return Err("No servers configured".into());
+        if self.listeners.is_empty() {
+            return Err("No listeners configured".into());
         }
 
         let mut ports = std::collections::HashSet::new();
-        for server in &self.servers {
-            if !ports.insert(server.listen) {
+        let mut names = std::collections::HashSet::new();
+
+        for listener in &self.listeners {
+            if !ports.insert(listener.port) {
+                return Err(format!("Duplicate listener port {}", listener.port).into());
+            }
+
+            if listener.routes.is_empty() {
                 return Err(format!(
-                    "Duplicate listen port {} for server '{}'",
-                    server.listen, server.name
+                    "Listener on port {} has no routes",
+                    listener.port
                 )
                 .into());
             }
-            if server.name.is_empty() {
-                return Err("Server name cannot be empty".into());
+
+            // If multiple routes, all must have model names
+            if listener.routes.len() > 1 {
+                let mut models = std::collections::HashSet::new();
+                for route in &listener.routes {
+                    let model = route.model.as_ref().ok_or_else(|| {
+                        format!(
+                            "Route '{}' on port {} must have a 'model' field (multiple routes share this port)",
+                            route.name, listener.port
+                        )
+                    })?;
+                    if !models.insert(model) {
+                        return Err(format!(
+                            "Duplicate model '{}' on port {}",
+                            model, listener.port
+                        )
+                        .into());
+                    }
+                }
             }
-            if server.backend.is_empty() {
-                return Err(format!(
-                    "Backend address cannot be empty for server '{}'",
-                    server.name
-                )
-                .into());
+
+            for route in &listener.routes {
+                if route.name.is_empty() {
+                    return Err("Route name cannot be empty".into());
+                }
+                if !names.insert(&route.name) {
+                    return Err(format!("Duplicate route name '{}'", route.name).into());
+                }
+                if route.backend.is_empty() {
+                    return Err(format!(
+                        "Backend address cannot be empty for route '{}'",
+                        route.name
+                    )
+                    .into());
+                }
             }
         }
         Ok(())
     }
 
-    pub fn effective_token<'a>(&'a self, server: &'a ServerConfig) -> Option<&'a str> {
-        // Per-server auth takes priority
-        if let Some(ref server_auth) = server.auth {
-            if server_auth.enabled {
-                return Some(&server_auth.token);
+    /// Resolve auth token: route > listener > global. Returns None if auth is disabled.
+    pub fn effective_token<'a>(
+        &'a self,
+        listener: &'a ListenerConfig,
+        route: &'a RouteConfig,
+    ) -> Option<&'a str> {
+        // Per-route auth takes priority
+        if let Some(ref route_auth) = route.auth {
+            if route_auth.enabled {
+                return Some(&route_auth.token);
             } else {
                 return None;
             }
         }
-        // Fall back to global auth
+        // Per-listener auth
+        if let Some(ref listener_auth) = listener.auth {
+            if listener_auth.enabled {
+                return Some(&listener_auth.token);
+            } else {
+                return None;
+            }
+        }
+        // Global auth
         if let Some(ref global_auth) = self.auth {
             if global_auth.enabled {
                 return Some(&global_auth.token);
@@ -129,118 +183,172 @@ mod tests {
 auth:
   token: "test-token"
 
-servers:
-  - name: test-server
-    listen: 8000
-    backend: localhost:8900
-    start: echo start
-    stop: echo stop
-    health: /health
-    idle_timeout: 600
+listeners:
+  - port: 8000
+    routes:
+      - name: test-server
+        backend: localhost:8900
+        start: echo start
+        stop: echo stop
+        health: /health
+        idle_timeout: 600
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.servers.len(), 1);
-        assert_eq!(config.servers[0].name, "test-server");
-        assert_eq!(config.servers[0].listen, 8000);
+        assert_eq!(config.listeners.len(), 1);
+        assert_eq!(config.listeners[0].routes[0].name, "test-server");
+        assert_eq!(config.listeners[0].port, 8000);
         assert_eq!(config.auth.as_ref().unwrap().token, "test-token");
     }
 
     #[test]
     fn test_parse_minimal_config() {
         let yaml = r#"
-servers:
-  - name: minimal
-    listen: 9000
-    backend: localhost:9001
-    start: echo start
-    stop: echo stop
+listeners:
+  - port: 9000
+    routes:
+      - name: minimal
+        backend: localhost:9001
+        start: echo start
+        stop: echo stop
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
-        let server = &config.servers[0];
-        assert_eq!(server.health, "/health");
-        assert_eq!(server.idle_timeout, 600);
-        assert_eq!(server.startup_timeout, 300);
-        assert_eq!(server.startup_poll_interval, 2);
+        let route = &config.listeners[0].routes[0];
+        assert_eq!(route.health, "/health");
+        assert_eq!(route.idle_timeout, 600);
+        assert_eq!(route.startup_timeout, 300);
+        assert_eq!(route.startup_poll_interval, 2);
         assert!(config.auth.is_none());
     }
 
     #[test]
     fn test_managed_subprocess_detection() {
         let yaml = r#"
-servers:
-  - name: managed
-    listen: 8000
-    backend: localhost:8001
-    start: /usr/bin/server
-    stop: managed-subprocess
+listeners:
+  - port: 8000
+    routes:
+      - name: managed
+        backend: localhost:8001
+        start: /usr/bin/server
+        stop: managed-subprocess
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(config.servers[0].is_managed_subprocess());
+        assert!(config.listeners[0].routes[0].is_managed_subprocess());
     }
 
     #[test]
-    fn test_per_server_auth_override() {
+    fn test_multi_route_requires_model() {
         let yaml = r#"
-auth:
-  token: "global-token"
-
-servers:
-  - name: with-override
-    listen: 8000
-    backend: localhost:8001
-    start: echo start
-    stop: echo stop
-    auth:
-      token: "server-token"
-  - name: uses-global
-    listen: 8001
-    backend: localhost:8002
-    start: echo start
-    stop: echo stop
-  - name: no-auth
-    listen: 8002
-    backend: localhost:8003
-    start: echo start
-    stop: echo stop
-    auth:
-      token: ""
-      enabled: false
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(
-            config.effective_token(&config.servers[0]),
-            Some("server-token")
-        );
-        assert_eq!(
-            config.effective_token(&config.servers[1]),
-            Some("global-token")
-        );
-        assert_eq!(config.effective_token(&config.servers[2]), None);
-    }
-
-    #[test]
-    fn test_validate_duplicate_ports() {
-        let yaml = r#"
-servers:
-  - name: server1
-    listen: 8000
-    backend: localhost:8001
-    start: echo start
-    stop: echo stop
-  - name: server2
-    listen: 8000
-    backend: localhost:8002
-    start: echo start
-    stop: echo stop
+listeners:
+  - port: 8000
+    routes:
+      - name: route1
+        backend: localhost:8001
+        start: echo start
+        stop: echo stop
+      - name: route2
+        backend: localhost:8002
+        start: echo start
+        stop: echo stop
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(config.validate().is_err());
     }
 
     #[test]
-    fn test_validate_empty_servers() {
+    fn test_multi_route_with_models() {
         let yaml = r#"
-servers: []
+listeners:
+  - port: 8000
+    routes:
+      - name: route1
+        model: model-a
+        backend: localhost:8001
+        start: echo start
+        stop: echo stop
+      - name: route2
+        model: model-b
+        backend: localhost:8002
+        start: echo start
+        stop: echo stop
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_auth_resolution_three_tiers() {
+        let yaml = r#"
+auth:
+  token: "global-token"
+
+listeners:
+  - port: 8000
+    auth:
+      token: "listener-token"
+    routes:
+      - name: with-route-auth
+        backend: localhost:8001
+        start: echo start
+        stop: echo stop
+        auth:
+          token: "route-token"
+      - name: uses-listener
+        model: model-b
+        backend: localhost:8002
+        start: echo start
+        stop: echo stop
+  - port: 9000
+    routes:
+      - name: uses-global
+        backend: localhost:9001
+        start: echo start
+        stop: echo stop
+  - port: 9001
+    routes:
+      - name: no-auth
+        backend: localhost:9002
+        start: echo start
+        stop: echo stop
+        auth:
+          token: ""
+          enabled: false
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let l0 = &config.listeners[0];
+        let l1 = &config.listeners[1];
+        let l2 = &config.listeners[2];
+
+        assert_eq!(config.effective_token(l0, &l0.routes[0]), Some("route-token"));
+        assert_eq!(config.effective_token(l0, &l0.routes[1]), Some("listener-token"));
+        assert_eq!(config.effective_token(l1, &l1.routes[0]), Some("global-token"));
+        assert_eq!(config.effective_token(l2, &l2.routes[0]), None);
+    }
+
+    #[test]
+    fn test_validate_duplicate_ports() {
+        let yaml = r#"
+listeners:
+  - port: 8000
+    routes:
+      - name: server1
+        backend: localhost:8001
+        start: echo start
+        stop: echo stop
+  - port: 8000
+    routes:
+      - name: server2
+        backend: localhost:8002
+        start: echo start
+        stop: echo stop
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_empty_listeners() {
+        let yaml = r#"
+listeners: []
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(config.validate().is_err());
@@ -249,17 +357,39 @@ servers: []
     #[test]
     fn test_backend_url() {
         let yaml = r#"
-servers:
-  - name: test
-    listen: 8000
-    backend: localhost:8001
-    start: echo start
-    stop: echo stop
+listeners:
+  - port: 8000
+    routes:
+      - name: test
+        backend: localhost:8001
+        start: echo start
+        stop: echo stop
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(
-            config.servers[0].backend_url("/v1/chat"),
+            config.listeners[0].routes[0].backend_url("/v1/chat"),
             "http://localhost:8001/v1/chat"
         );
+    }
+
+    #[test]
+    fn test_validate_duplicate_names() {
+        let yaml = r#"
+listeners:
+  - port: 8000
+    routes:
+      - name: same-name
+        backend: localhost:8001
+        start: echo start
+        stop: echo stop
+  - port: 9000
+    routes:
+      - name: same-name
+        backend: localhost:9001
+        start: echo start
+        stop: echo stop
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.validate().is_err());
     }
 }
