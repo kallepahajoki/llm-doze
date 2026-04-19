@@ -1,0 +1,46 @@
+# LLM-Doze sample configuration
+#
+# Global authentication - applies to all servers unless overridden per-server.
+# Clients must send: Authorization: Bearer <token>
+# Remove or set enabled: false to disable auth entirely.
+auth:
+  token: "your-secret-token-here"
+  # enabled: true
+
+servers:
+  # vLLM via Docker Compose
+  # Proxy listens on :8000, forwards to the vLLM container on localhost:8900
+  - name: vllm-model
+    listen: 8000
+    backend: localhost:8900
+    start: docker compose -f /opt/llm/docker-compose-model.yml up -d
+    stop: docker compose -f /opt/llm/docker-compose-model.yml down
+    health: /health
+    idle_timeout: 600          # seconds before auto-stop (10 min)
+    startup_timeout: 300       # max seconds to wait for health check
+    startup_poll_interval: 2   # seconds between health polls
+
+  # Ollama via systemctl
+  # Proxy listens on :11434, forwards to Ollama on localhost:11435
+  - name: ollama
+    listen: 11434
+    backend: localhost:11435
+    start: systemctl start ollama
+    stop: systemctl stop ollama
+    health: /api/tags
+    idle_timeout: 600
+
+  # llama-server as a managed subprocess
+  # The proxy spawns the process directly and kills it on stop.
+  # Use stop: managed-subprocess to enable this mode.
+  - name: reranker
+    listen: 8090
+    backend: localhost:8091
+    start: /opt/llm/llama-server -m /opt/llm/models/bge-reranker-v2-m3.gguf --port 8091 --host 127.0.0.1 --reranking
+    stop: managed-subprocess
+    health: /health
+    idle_timeout: 300
+    # Per-server auth override (optional):
+    # auth:
+    #   token: "reranker-specific-token"
+    #   enabled: true
