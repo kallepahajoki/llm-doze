@@ -31,10 +31,38 @@ Client → [LLM-Doze proxy :8000] → [vLLM backend localhost:8900]
 
 ## Installation
 
+### Build
+
 ```bash
 cargo build --release
-# Binary at target/release/llm-doze
 ```
+
+### Install as systemd service
+
+```bash
+# Copy binary
+sudo cp target/release/llm-doze /usr/local/bin/
+
+# Create config directory and copy your config
+sudo mkdir -p /etc/llm-doze
+sudo cp config.yaml /etc/llm-doze/config.yaml
+
+# Install and enable the service
+sudo cp llm-doze.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now llm-doze
+```
+
+### Logs
+
+LLM-Doze logs to stderr, which systemd captures in journald:
+
+```bash
+journalctl -u llm-doze -f            # follow live
+journalctl -u llm-doze --since today  # today's logs
+```
+
+Set `Environment=RUST_LOG=debug` in the service file for verbose output.
 
 ## Usage
 

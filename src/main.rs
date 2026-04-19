@@ -8,9 +8,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
+use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -28,19 +29,36 @@ struct Cli {
     /// Bind address (0.0.0.0 for all interfaces)
     #[arg(short, long, default_value = "0.0.0.0")]
     bind: String,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Check health status of all configured backends
+    Status,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    let config = Config::load(&cli.config)?;
+
+    match cli.command {
+        Some(Commands::Status) => {
+            run_status(&config).await;
+            return Ok(());
+        }
+        None => {}
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-
-    let cli = Cli::parse();
-    let config = Config::load(&cli.config)?;
 
     info!(
         servers = config.servers.len(),
@@ -87,6 +105,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+async fn run_status(config: &Config) {
+    let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+        .build_http::<http_body_util::Empty<bytes::Bytes>>();
+
+    let mut results = Vec::new();
+
+    for server_config in &config.servers {
+        let url = server_config.backend_url(&server_config.health);
+        let status = match client.get(url.parse::<hyper::Uri>().unwrap()).await {
+            Ok(resp) if resp.status().is_success() => "running",
+            Ok(resp) => {
+                // Store the status string to avoid temp value issues
+                results.push((server_config, format!("unhealthy ({})", resp.status())));
+                continue;
+            }
+            Err(_) => "stopped",
+        };
+        results.push((server_config, status.to_string()));
+    }
+
+    // Print table
+    let name_width = results
+        .iter()
+        .map(|(s, _)| s.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let backend_width = results
+        .iter()
+        .map(|(s, _)| s.backend.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+
+    println!(
+        "{:<name_width$}  {:>6}  {:<backend_width$}  {}",
+        "NAME", "PORT", "BACKEND", "STATUS"
+    );
+    println!(
+        "{:<name_width$}  {:>6}  {:<backend_width$}  {}",
+        "─".repeat(name_width),
+        "──────",
+        "─".repeat(backend_width),
+        "───────"
+    );
+
+    for (server_config, status) in &results {
+        let indicator = match status.as_str() {
+            "running" => "● running",
+            "stopped" => "○ stopped",
+            other => other,
+        };
+        println!(
+            "{:<name_width$}  {:>6}  {:<backend_width$}  {}",
+            server_config.name, server_config.listen, server_config.backend, indicator
+        );
+    }
 }
 
 async fn run_listener(
