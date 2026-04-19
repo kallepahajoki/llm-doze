@@ -23,13 +23,19 @@ Client → [LLM-Doze proxy :8000] → [vLLM backend localhost:8900]
 
 On startup, LLM-Doze probes each backend's health endpoint to detect already-running services and track them for idle shutdown.
 
-## Supported backend types
+## Backend lifecycle
 
-| Type | `stop` field | Behavior |
-|------|-------------|----------|
-| Docker Compose | `docker compose ... down` | Runs start/stop commands via shell |
-| systemctl | `systemctl stop <service>` | Runs start/stop commands via shell |
-| Managed subprocess | `managed-subprocess` | Spawns the `start` command as a child process, kills it on stop (SIGTERM → SIGKILL) |
+Any service that can be started and stopped with a shell command will work. The `start` and `stop` fields are run via `sh -c`, so anything you can run in a terminal is supported.
+
+There is one special mode: setting `stop: managed-subprocess` makes LLM-Doze spawn the `start` command as a child process and manage its lifetime directly (SIGTERM, then SIGKILL after a grace period). This is useful for services that don't have their own start/stop mechanism.
+
+**Examples:**
+
+| Backend | `start` | `stop` |
+|---------|---------|--------|
+| Docker Compose | `docker compose -f ... up -d` | `docker compose -f ... down` |
+| systemctl | `systemctl start ollama` | `systemctl stop ollama` |
+| Direct process | `/usr/bin/llama-server -m model.gguf --port 8091` | `managed-subprocess` |
 
 ## Installation
 
